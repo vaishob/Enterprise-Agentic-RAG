@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Test Job Orchestration in Playwright</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 24px; color: #0B2027; line-height: 1.55; }
+  h1 { font-size: 28px; border-bottom: 3px solid #028090; padding-bottom: 10px; }
+  h2 { font-size: 20px; color: #028090; margin-top: 34px; }
+  h3 { font-size: 16px; color: #00695C; margin-top: 22px; }
+  code { background: #F2F8F8; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 13.5px; }
+  pre { background: #0B2027; color: #E8F6F6; padding: 14px 18px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #DCEBEB; padding: 8px 12px; text-align: left; font-size: 14px; }
+  th { background: #F2F8F8; }
+  .note { background: #F2F8F8; border-radius: 8px; padding: 12px 16px; font-size: 14px; margin: 16px 0; }
+</style>
+</head>
+<body>
+
+<h1>Test Job Orchestration</h1>
+<p>Playwright Test does not treat a run as one flat list of specs. It groups work into <strong>projects</strong>, filters that work with <strong>tags and grep patterns</strong>, and sequences it with <strong>dependencies</strong> \u2014 together these are what let a single test suite behave like several distinct "jobs" without duplicating code.</p>
+
+<h2>Projects: the unit of orchestration</h2>
+<p>A <code>project</code> in <code>playwright.config.ts</code> is a named configuration \u2014 browser, viewport, base URL, storage state \u2014 that a subset of your tests will run under. Most teams define one project per browser engine, but projects are just as useful for splitting environments or test categories:</p>
+
+<pre>export default defineConfig({
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+    { name: 'firefox',  use: { ...devices['Desktop Firefox'] } },
+    { name: 'webkit',   use: { ...devices['Desktop Safari'] } },
+    { name: 'mobile-smoke', use: { ...devices['iPhone 13'] }, testMatch: /smoke\/.*\.spec\.ts/ },
+  ],
+});</pre>
+
+<p>Running <code>npx playwright test --project=chromium</code> executes only that project's slice of the suite \u2014 this is the mechanism CI matrices use to split a run into independent jobs that can be scheduled on separate machines.</p>
+
+<h2>Filtering work: tags and grep</h2>
+<p>Rather than maintaining separate spec files per job, tests can be annotated and filtered at run time:</p>
+
+<pre>test('checkout completes with saved card @smoke @regression', async ({ page }) => {
+  // ...
+});</pre>
+
+<pre># Run only smoke-tagged tests
+npx playwright test --grep @smoke
+
+# Run everything except slow/flaky-quarantined tests
+npx playwright test --grep-invert @quarantine</pre>
+
+<table>
+<tr><th>Flag</th><th>Effect</th></tr>
+<tr><td><code>--grep</code></td><td>Include tests whose title matches the pattern or tag</td></tr>
+<tr><td><code>--grep-invert</code></td><td>Exclude tests whose title matches the pattern or tag</td></tr>
+<tr><td><code>--project</code></td><td>Restrict the run to one or more named projects</td></tr>
+<tr><td><code>--shard</code></td><td>Split the resolved test list across N machines by index</td></tr>
+</table>
+
+<h2>Dependencies between projects</h2>
+<p>Some jobs genuinely need to run before others \u2014 authentication being the most common case. A <code>dependencies</code> field turns one project into a prerequisite for another, and Playwright's dispatcher will not start the dependent project's workers until the dependency project has finished successfully:</p>
+
+<pre>projects: [
+  { name: 'setup', testMatch: /global\.setup\.ts/ },
+  { name: 'chromium', use: { storageState: 'playwright/.auth/user.json' }, dependencies: ['setup'] },
+]</pre>
+
+<div class="note">Dependencies are resolved once per run, not once per worker \u2014 the saved <code>storageState</code> is reused by every worker in the dependent project, so authentication only happens a single time even across dozens of parallel workers.</div>
+
+<h2>Global setup and teardown</h2>
+<p>For orchestration concerns that sit above any single project \u2014 seeding a database, starting a mock server, tearing down shared fixtures \u2014 <code>globalSetup</code> and <code>globalTeardown</code> run once for the entire invocation, regardless of how many projects or shards are involved:</p>
+
+<pre>export default defineConfig({
+  globalSetup: require.resolve('./global-setup.ts'),
+  globalTeardown: require.resolve('./global-teardown.ts'),
+});</pre>
+
+<h2>Composing it into a CI matrix</h2>
+<p>In practice, orchestration in CI usually combines all three mechanisms: a matrix strategy iterates over projects (or shards), each matrix entry runs <code>--project</code> and/or <code>--shard</code> to claim its slice, and a final job waits on all of them before merging reports. The result is a set of independent, resumable "jobs" carved out of one shared test definition, rather than one long serial run.</p>
+
+<pre>jobs:
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [chromium, firefox, webkit]
+        shardIndex: [1, 2]
+        shardTotal: [2]
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: >
+          npx playwright test
+          --project=${{ matrix.project }}
+          --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blob-report-${{ matrix.project }}-${{ matrix.shardIndex }}
+          path: blob-report
+
+  merge-reports:
+    needs: [e2e]
+    steps:
+      - uses: actions/download-artifact@v4
+      - run: npx playwright merge-reports --reporter=html ./all-blob-reports</pre>
+
+<p>This single matrix expands into six independent jobs (three projects &times; two shards), each a self-contained "unit of work" that can fail, retry, or be re-run in isolation without touching the other five.</p>
+
+<h2>Annotations for job-level control</h2>
+<p>Beyond tags, Playwright supports annotations that change how a test participates in a run entirely, which is often a cleaner way to carve out a "job" than maintaining a separate spec file:</p>
+
+<table>
+<tr><th>Annotation</th><th>Effect</th></tr>
+<tr><td><code>test.skip(condition, reason)</code></td><td>Skip a test conditionally \u2014 e.g. skip a mobile-only test on desktop projects</td></tr>
+<tr><td><code>test.fixme(condition, reason)</code></td><td>Mark a known-broken test as expected to fail, without deleting it</td></tr>
+<tr><td><code>test.slow()</code></td><td>Triple the default timeout for a test known to be legitimately slow</td></tr>
+<tr><td><code>test.describe.configure({ retries: 0 })</code></td><td>Override retries for one group, independent of the global config</td></tr>
+</table>
+
+<pre>test.describe('checkout', () => {
+  test.describe.configure({ retries: 0 }); // this group must never mask flakes
+
+  test('rejects an expired card', async ({ page }) => {
+    test.skip(process.env.PAYMENT_SANDBOX !== 'true', 'requires sandbox payment provider');
+    // ...
+  });
+});</pre>
+
+<h2>Structuring a test into sub-steps</h2>
+<p><code>test.step()</code> doesn't change scheduling, but it gives long tests a job-like internal structure in the report \u2014 each step shows up as a collapsible node with its own timing, which makes a single 40-line test readable as a sequence of named phases rather than one flat block:</p>
+
+<pre>test('completes a full purchase', async ({ page }) => {
+  await test.step('add item to cart', async () => { ... });
+  await test.step('apply promo code', async () => { ... });
+  await test.step('submit payment', async () => { ... });
+});</pre>
+
+<h2>Reading job identity at runtime</h2>
+<p>Inside a test, <code>testInfo()</code> exposes exactly which "job" a given execution belongs to \u2014 useful for routing logs, naming screenshots, or tagging any external system a test touches with the run that produced it:</p>
+
+<pre>test('example', async ({ page }, testInfo) => {
+  console.log(testInfo.project.name);   // e.g. "chromium"
+  console.log(testInfo.workerIndex);    // e.g. 2
+  console.log(testInfo.retry);          // 0 on first attempt, 1+ on retries
+});</pre>
+
+<div class="note">Combining project name, shard index, and worker index gives every single test execution a fully unique coordinate \u2014 useful when correlating a failure back to the exact CI job and machine that produced it.</div>
+
+<h2>Designing a tag taxonomy</h2>
+<p>Tags are just substrings in a test title, so nothing stops a team from inventing dozens of one-off tags that quietly stop meaning anything after a few months. A small, deliberate taxonomy tends to age better than an organic one:</p>
+
+<table>
+<tr><th>Tag</th><th>Intended job</th><th>Typical trigger</th></tr>
+<tr><td><code>@smoke</code></td><td>Fast confidence check</td><td>Every push, pre-merge</td></tr>
+<tr><td><code>@regression</code></td><td>Full functional coverage</td><td>Nightly, pre-release</td></tr>
+<tr><td><code>@visual</code></td><td>Screenshot comparison suite</td><td>Nightly, isolated job (different infra needs)</td></tr>
+<tr><td><code>@quarantine</code></td><td>Known-flaky, excluded from gating</td><td>Never blocks merges; tracked separately</td></tr>
+</table>
+
+<p>Two properties matter more than the exact names chosen: every tag should map to a specific CI job that consumes it, and a test should never need more than two or three tags before the taxonomy itself needs revisiting.</p>
+
+<h2>Grep patterns beyond a single tag</h2>
+<p><code>--grep</code> accepts a regular expression, not just a literal tag, which allows more precise slices of a suite to be carved into a job without adding new tags:</p>
+
+<pre># Only checkout-related smoke tests
+npx playwright test --grep "@smoke.*checkout|checkout.*@smoke"
+
+# Everything in the "billing" describe block
+npx playwright test --grep "^billing "
+
+# Skip anything tagged either quarantine or manual-only
+npx playwright test --grep-invert "@quarantine|@manual"</pre>
+
+<p>Because the pattern matches against the full test title \u2014 including any parent <code>describe</code> blocks \u2014 nesting related tests inside a named <code>describe</code> is often enough to carve out a job-sized slice without any tagging at all.</p>
+
+<h2>Anti-patterns to avoid</h2>
+<ul>
+<li><strong>Duplicating a spec file per environment.</strong> A <code>checkout.staging.spec.ts</code> and <code>checkout.prod.spec.ts</code> that differ only in base URL are better expressed as one spec file and two projects with different <code>use.baseURL</code> values.</li>
+<li><strong>Encoding job identity in the test title alone.</strong> Titles are for humans reading a report; use <code>testInfo</code>, tags, and project names \u2014 which are queryable \u2014 rather than parsing conventions out of a string.</li>
+<li><strong>One giant project with conditional logic inside every test.</strong> If half your tests branch on <code>if (isMobile) { ... } else { ... }</code>, that's usually a sign the branch should be a second project instead.</li>
+</ul>
+
+<h2>Timeouts at every level</h2>
+<p>A "job" hanging indefinitely is often worse than one failing fast, so Playwright layers timeouts at several scopes rather than relying on one global value:</p>
+
+<table>
+<tr><th>Scope</th><th>Config key</th><th>Typical default</th></tr>
+<tr><td>Per test</td><td><code>timeout</code></td><td>30s</td></tr>
+<tr><td>Per assertion</td><td><code>expect.timeout</code></td><td>5s</td></tr>
+<tr><td>Whole run (all projects/shards combined)</td><td><code>globalTimeout</code></td><td>unset (no cap)</td></tr>
+<tr><td>Global setup</td><td><code>globalSetupTimeout</code> (via CLI wrapper)</td><td>inherits per-test default</td></tr>
+</table>
+
+<p>Setting <code>globalTimeout</code> in CI is a common safeguard on top of per-test timeouts: it caps how long an entire job can occupy a CI runner even if some unexpected condition (a hung browser, a stuck network request) causes many individual per-test timeouts to chain together longer than expected.</p>
+
+<pre>export default defineConfig({
+  timeout: 30_000,
+  globalTimeout: 60 * 60 * 1000, // hard stop at 1 hour for the whole run
+  expect: { timeout: 5_000 },
+});</pre>
+
+<h2>Quick reference: choosing a mechanism</h2>
+<p>A rough decision guide for which orchestration tool fits a given need:</p>
+<ul>
+<li>Different browser/device/environment &rarr; <strong>project</strong></li>
+<li>Subset of an existing suite, run on demand &rarr; <strong>tag + grep</strong></li>
+<li>One project must run before another &rarr; <strong>dependencies</strong></li>
+<li>Suite too large for one machine &rarr; <strong>sharding</strong></li>
+<li>Setup/teardown shared by the whole run &rarr; <strong>globalSetup / globalTeardown</strong></li>
+</ul>
+
+</body>
+</html>

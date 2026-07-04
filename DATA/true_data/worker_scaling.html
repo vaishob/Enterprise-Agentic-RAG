@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Scaling Test Workers Across CI Runners</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 24px; color: #0B2027; line-height: 1.55; }
+  h1 { font-size: 28px; border-bottom: 3px solid #028090; padding-bottom: 10px; }
+  h2 { font-size: 20px; color: #028090; margin-top: 34px; }
+  h3 { font-size: 16px; color: #00695C; margin-top: 22px; }
+  code { background: #F2F8F8; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 13.5px; }
+  pre { background: #0B2027; color: #E8F6F6; padding: 14px 18px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #DCEBEB; padding: 8px 12px; text-align: left; font-size: 14px; }
+  th { background: #F2F8F8; }
+  .note { background: #F2F8F8; border-radius: 8px; padding: 12px 16px; font-size: 14px; margin: 16px 0; }
+  .warn { background: #FFF4E5; border-radius: 8px; padding: 12px 16px; font-size: 14px; margin: 16px 0; }
+</style>
+</head>
+<body>
+
+<h1>Scaling Test Workers Across CI Runners</h1>
+<p>A single machine only scales a Playwright suite so far \u2014 workers are capped by CPU cores, and browsers are memory-hungry. Beyond a certain suite size, the only way to keep run time flat is to scale <em>out</em> across multiple CI runners, not just <em>up</em> within one.</p>
+
+<h2>Two axes of scaling</h2>
+<table>
+<tr><th>Axis</th><th>Mechanism</th><th>Bound by</th></tr>
+<tr><td>Vertical (within a machine)</td><td><code>workers</code> config / <code>--workers</code></td><td>CPU cores, available memory</td></tr>
+<tr><td>Horizontal (across machines)</td><td><code>--shard=x/y</code> + CI matrix</td><td>Number of parallel runner jobs your CI plan allows</td></tr>
+</table>
+
+<h2>Horizontal scaling with sharding</h2>
+<p>Sharding splits the resolved test list into equal slices by index, letting each CI runner claim one slice independently:</p>
+<pre># .github/workflows/e2e.yml
+strategy:
+  matrix:
+    shardIndex: [1, 2, 3, 4]
+    shardTotal: [4]
+steps:
+  - run: npx playwright test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}</pre>
+<p>Each matrix entry is a fully independent job \u2014 its own runner, its own container, its own worker pool sized by that runner's CPU count. Scaling from 4 to 8 shards is a one-line change to the matrix, with no change to the test code itself.</p>
+
+<h2>Containerizing the worker</h2>
+<p>Official Playwright Docker images bundle matching browser binaries with the npm package version, which avoids the most common source of CI flakiness: a browser binary that's silently out of sync with the test runner.</p>
+<pre>FROM mcr.microsoft.com/playwright:v1.48.0-jammy
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+CMD ["npx", "playwright", "test", "--shard=${SHARD_INDEX}/${SHARD_TOTAL}"]</pre>
+<div class="note">Pin the image tag to the exact Playwright version in <code>package.json</code>. A mismatched browser/runner version pair is a frequent cause of tests that pass locally and fail only in CI.</div>
+
+<h3>Sizing a worker container</h3>
+<p>Each headless Chromium/WebKit/Firefox instance typically needs on the order of 300\u2013500MB of memory under moderate page weight, so a container running <code>N</code> workers should budget roughly <code>N \u00d7 500MB</code> plus headroom for the Node.js process itself. Under-provisioning memory shows up as workers being silently OOM-killed rather than as a clear test failure, which makes it a disproportionately confusing failure mode to debug from logs alone.</p>
+
+<h2>Dynamic runner pools</h2>
+<p>Self-hosted CI runner pools (GitHub Actions runner groups, GitLab autoscaling runners, Buildkite elastic stacks) can scale the number of available runner machines up and down based on queue depth, rather than keeping a fixed pool warm at all times:</p>
+<ul>
+<li>Queue depth crosses a threshold \u2192 the autoscaler provisions additional runner instances</li>
+<li>New instances register with the CI control plane and pick up queued shard jobs</li>
+<li>Once the queue drains, idle instances are terminated after a cool-down window</li>
+</ul>
+<div class="warn">Autoscaled runners are usually ephemeral \u2014 don't rely on local disk state (cached browsers, node_modules) surviving between runs unless the pool explicitly supports a persistent cache layer.</div>
+
+<h2>Cost vs. speed tradeoffs</h2>
+<p>More shards reduce wall-clock time close to linearly until per-job fixed overhead (checkout, dependency install, browser download) starts to dominate. Past that point, additional shards mostly add cost without meaningfully shortening the run \u2014 the practical ceiling for most suites sits where fixed per-job overhead reaches roughly 15\u201320% of that shard's total run time.</p>
+
+<table>
+<tr><th>Shards</th><th>Approx. wall time</th><th>Runner-minutes billed</th><th>Notes</th></tr>
+<tr><td>1</td><td>40 min</td><td>40</td><td>Baseline, no fixed overhead multiplication</td></tr>
+<tr><td>4</td><td>11 min</td><td>44</td><td>Near-linear speedup, small overhead cost</td></tr>
+<tr><td>8</td><td>7 min</td><td>56</td><td>Diminishing returns begin</td></tr>
+<tr><td>16</td><td>6 min</td><td>96</td><td>Fixed overhead now dominates; poor value</td></tr>
+</table>
+<p>The table illustrates the general shape rather than fixed numbers \u2014 the actual crossover point depends heavily on how expensive checkout and dependency install are relative to the suite itself.</p>
+
+<h2>Caching browser binaries</h2>
+<p>Downloading Chromium, WebKit, and Firefox on every job is one of the largest fixed costs in a scaled-out CI setup. Caching the browser binary directory keyed off the installed Playwright version avoids re-downloading them on every shard:</p>
+<pre>- uses: actions/cache@v4
+  id: playwright-cache
+  with:
+    path: ~/.cache/ms-playwright
+    key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+- run: npx playwright install --with-deps
+  if: steps.playwright-cache.outputs.cache-hit != 'true'</pre>
+<p>Skipping the install step entirely on a cache hit \u2014 rather than always running <code>playwright install</code> \u2014 is what actually saves time; the cache alone does nothing if the install command still runs unconditionally afterward.</p>
+
+<h2>Choosing a runner type</h2>
+<table>
+<tr><th>Runner type</th><th>Scales by</th><th>Best for</th></tr>
+<tr><td>Vendor-hosted (GitHub/GitLab shared runners)</td><td>Matrix size, within plan limits</td><td>Most teams; zero infra to manage</td></tr>
+<tr><td>Self-hosted, fixed pool</td><td>Manually provisioned machine count</td><td>Predictable, steady load; custom hardware needs</td></tr>
+<tr><td>Self-hosted, autoscaling</td><td>Queue depth</td><td>Bursty load \u2014 large nightly runs, quiet daytime</td></tr>
+<tr><td>Managed cloud device farms</td><td>Vendor's own pool</td><td>Real-device mobile coverage alongside desktop browsers</td></tr>
+</table>
+
+<h2>Monitoring worker utilization</h2>
+<p>Once a suite is scaled across several shards and workers, the more useful signal is usually not "did it pass" but "how efficiently did it use the machines it was given." Worth tracking over time:</p>
+<ul>
+<li><strong>Per-worker idle time</strong> \u2014 large gaps suggest test files are unevenly sized and would benefit from re-balancing (Playwright's default distribution is by file count, not by historical duration)</li>
+<li><strong>Peak memory per container</strong> \u2014 approaching the container's limit is an early warning sign for OOM-killed workers before they start failing outright</li>
+<li><strong>Shard finish-time spread</strong> \u2014 if one shard reliably finishes far later than the others, the test list isn't being split evenly in practice and a duration-aware split (or manual re-grouping) is worth investigating</li>
+</ul>
+
+<h2>Troubleshooting common scaling issues</h2>
+<table>
+<tr><th>Symptom</th><th>Likely cause</th></tr>
+<tr><td>Tests pass locally, fail only under high shard count</td><td>Shared external resource (DB, fixed port) not isolated per worker</td></tr>
+<tr><td>Workers silently disappear from the report</td><td>Container OOM-killed the worker process; check memory limits</td></tr>
+<tr><td>One shard consistently 2\u20133x slower than others</td><td>Uneven file-based split; consider grouping slow specs across shards</td></tr>
+<tr><td>Intermittent browser launch failures under load</td><td>Runner CPU oversubscribed by too many concurrent workers per core</td></tr>
+</table>
+
+<h2>Example resource limits (docker-compose)</h2>
+<pre>services:
+  playwright-worker:
+    image: mcr.microsoft.com/playwright:v1.48.0-jammy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+    environment:
+      - PLAYWRIGHT_WORKERS=4
+    command: npx playwright test --shard=${SHARD_INDEX}/${SHARD_TOTAL}</pre>
+<p>As a starting point, budgeting roughly 0.5 CPU and 500MB of memory per worker keeps most suites comfortably within limits; suites with particularly heavy pages (large SPAs, video, canvas-heavy UI) should budget higher and verify against observed peak memory rather than this rule of thumb alone.</p>
+
+<h2>Headless rendering and GPU considerations</h2>
+<p>Headless Chromium, WebKit, and Firefox all render without a physical display, but "headless" doesn't mean "no rendering work happens" \u2014 layout, paint, and compositing still run in software unless a GPU is explicitly made available to the container. On most CI runners there is no GPU at all, which is usually fine for functional testing but has two practical consequences worth planning for:</p>
+<ul>
+<li><strong>Visual/screenshot tests are more sensitive to the renderer.</strong> Software rendering can produce subtly different anti-aliasing or font hinting than a GPU-backed render on a developer's machine, which is why screenshot baselines are usually generated inside the same container image the CI job uses, not captured locally.</li>
+<li><strong>CPU cost per page goes up without a GPU.</strong> Pages with heavy CSS animation, canvas, or WebGL content shift rendering cost onto the CPU cores that workers are already competing for, which is one more reason worker count and container CPU limits need to be tuned together rather than independently.</li>
+</ul>
+<p>Some managed CI platforms do expose GPU-backed runners for exactly this reason, but they are a deliberate opt-in for suites where render fidelity or GPU-dependent behavior actually matters, not a default choice.</p>
+
+<h2>A worked scaling example</h2>
+<p>To make the tradeoffs concrete: consider a suite of 600 test files with an average of 4 seconds per file, giving roughly 40 minutes of sequential work.</p>
+<table>
+<tr><th>Configuration</th><th>Workers per shard</th><th>Shards</th><th>Approx. wall time</th></tr>
+<tr><td>Single runner, default workers</td><td>4</td><td>1</td><td>~10 min</td></tr>
+<tr><td>Single runner, maxed workers</td><td>8</td><td>1</td><td>~6 min (memory-bound past this point)</td></tr>
+<tr><td>Matrix of runners, moderate sharding</td><td>4</td><td>4</td><td>~3 min</td></tr>
+<tr><td>Matrix of runners, aggressive sharding</td><td>2</td><td>8</td><td>~2.5 min, higher total runner-minutes</td></tr>
+</table>
+<p>The jump from 1 shard to 4 shards gives the largest practical improvement for the least added cost; going from 4 to 8 shards buys a smaller further reduction while roughly doubling billed runner-minutes \u2014 the same diminishing-returns pattern shows up regardless of the specific suite size or per-test duration.</p>
+
+<h2>Frequently asked questions</h2>
+<h3>Does adding more shards always reduce wall-clock time?</h3>
+<p>Only up to the point where fixed per-job overhead (checkout, install, browser cache restore) stops being negligible relative to the shard's share of the suite. Beyond that point, more shards mostly add cost.</p>
+<h3>Should shard count match worker count?</h3>
+<p>No \u2014 they solve different problems. Workers parallelize within one machine's CPU budget; shards parallelize across separate machines entirely. A well-tuned setup usually sets workers close to a single runner's core count, and separately tunes shard count based on total suite size and acceptable wall-clock time.</p>
+<h3>Is it worth building a custom autoscaler instead of using vendor-hosted runners?</h3>
+<p>Usually only once vendor-hosted runner limits or cost at your actual concurrency level become a real constraint \u2014 for most suites the operational cost of running and monitoring a self-hosted autoscaling pool outweighs the savings until CI usage reaches a significant, sustained scale.</p>
+
+<h2>Provider-specific autoscaling configuration</h2>
+<p>The concept \u2014 scale runner count with queue depth, scale back down on idle \u2014 is consistent across CI providers, but the configuration surface differs enough to be worth comparing directly.</p>
+
+<h3>GitHub Actions (self-hosted, autoscaling runner scale sets)</h3>
+<pre># values.yaml for actions-runner-controller
+minRunners: 0
+maxRunners: 20
+scaleDownDelaySecondsAfterScaleOut: 300
+template:
+  spec:
+    containers:
+      - name: runner
+        resources:
+          requests: { cpu: "2", memory: "4Gi" }
+          limits:   { cpu: "2", memory: "4Gi" }</pre>
+<p>The controller watches the Actions job queue directly and provisions ephemeral runner pods on demand; each pod runs exactly one job and is discarded afterward, which keeps the pool naturally clean of stale state between runs.</p>
+
+<h3>GitLab CI (autoscaling Docker Machine executor)</h3>
+<pre>[[runners]]
+  limit = 20
+  [runners.machine]
+    IdleCount = 1
+    IdleTime = 600
+    MaxBuilds = 1
+    MachineDriver = "amazonec2"</pre>
+<p><code>MaxBuilds = 1</code> is the equivalent guarantee to GitHub's ephemeral pods \u2014 each provisioned machine handles exactly one job before being torn down, trading a small provisioning-time cost for a guarantee that no state leaks between jobs.</p>
+
+<h3>Buildkite (elastic CI stack)</h3>
+<pre>MIN_SIZE: 0
+MAX_SIZE: 30
+SCALE_IN_IDLE_PERIOD: 300
+SCALE_IN_COOLDOWN_PERIOD: 60</pre>
+<p>Buildkite's elastic stack watches its own job queue via CloudWatch metrics and adjusts an underlying EC2 auto-scaling group directly, which makes tuning scale-in aggressiveness a matter of adjusting cooldown periods rather than pool size directly.</p>
+
+<h2>Glossary</h2>
+<table>
+<tr><th>Term</th><th>Meaning in this context</th></tr>
+<tr><td>Worker</td><td>An OS process within one machine that executes test files, managed by Playwright's own dispatcher</td></tr>
+<tr><td>Shard</td><td>A slice of the overall test list, run as an independent CI job, typically on its own machine</td></tr>
+<tr><td>Runner</td><td>The machine (physical, virtual, or containerized) that a CI job executes on</td></tr>
+<tr><td>Ephemeral runner</td><td>A runner instance that is provisioned for exactly one job and destroyed afterward</td></tr>
+<tr><td>Cooldown / idle period</td><td>The delay an autoscaler waits with no new jobs before terminating an idle runner</td></tr>
+</table>
+
+<h2>Capacity planning checklist</h2>
+<p>Before changing shard or worker counts on an existing pipeline, it's worth establishing a baseline rather than tuning by trial and error under pressure during a slow release week:</p>
+<ul>
+<li>Record current wall-clock time, shard count, and worker count together \u2014 changing one without recording the others makes later comparisons meaningless.</li>
+<li>Capture peak memory per worker over at least a week of runs, not a single sample \u2014 memory use varies with which specific tests land on which worker.</li>
+<li>Separate "suite got slower" from "infrastructure got slower" by checking whether average per-test duration changed, or only the number of tests changed.</li>
+<li>Re-evaluate shard count whenever suite size grows by roughly 30\u201340% \u2014 the previous split point was tuned for a different total, and small suites that grow gradually often end up several tunings behind where they should be.</li>
+<li>Treat any autoscaling minimum-runner setting above zero as a standing cost, not a one-time decision \u2014 idle warm capacity is billed the same as active capacity on most platforms.</li>
+</ul>
+<p>None of this replaces measuring your own pipeline directly \u2014 the numbers throughout this document illustrate the shape of the tradeoffs, not values to copy verbatim into a specific CI configuration.</p>
+
+</body>
+</html>

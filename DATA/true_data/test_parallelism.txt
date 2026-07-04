@@ -1,0 +1,151 @@
+PLAYWRIGHT TEST PARALLELISM
+============================
+
+Overview
+--------
+Playwright Test runs test FILES in parallel by default, using a pool of
+worker processes. This note covers how the worker pool is sized, how
+isolation is maintained between workers, and how a run scales beyond a
+single machine via sharding.
+
+
+Workers
+-------
+A "worker" is a separate OS process that Playwright's test runner spawns
+to execute one or more test files. Key facts:
+
+  - Default worker count is based on available CPU cores (commonly the
+    core count on a developer machine, and roughly half the core count
+    on most CI runners, since CI environments often share physical cores
+    across concurrent jobs).
+  - Worker count is configurable directly:
+
+      npx playwright test --workers=4
+
+    or in playwright.config.ts:
+
+      export default defineConfig({
+        workers: process.env.CI ? 2 : undefined,
+      });
+
+  - Each worker is single-threaded from Playwright's point of view: it
+    runs one test at a time, finishes it, then moves to the next test
+    assigned to it.
+
+
+Isolation between workers
+--------------------------
+Workers do not share state. Each worker gets:
+
+  - Its own Node.js process (a crashed worker cannot take down others)
+  - A fresh BrowserContext per test file, so cookies, local storage, and
+    cache never leak between files even within the same worker
+  - Its own copy of any module-level state, since it's a separate process
+
+This is what makes "just run everything in parallel" safe as a default
+rather than something that requires careful manual coordination. The one
+piece of shared state to watch for is anything OUTSIDE the browser: a
+shared database, a shared file on disk, or a fixed port number. Those
+still need explicit coordination (e.g. a unique DB schema or port per
+worker, keyed off process.env.TEST_WORKER_INDEX).
+
+
+File-level vs test-level parallelism
+-------------------------------------
+By default, parallelism is applied at the FILE level: tests inside the
+same file run sequentially, one after another, even though different
+files run concurrently across workers. To also parallelize tests WITHIN
+a single file:
+
+  export default defineConfig({
+    fullyParallel: true,
+  });
+
+Combined with test.describe.serial(), you can still force a specific
+group of tests to run in strict order even when fullyParallel is on:
+
+  test.describe.serial('checkout flow, in order', () => {
+    test('adds item to cart', async ({ page }) => { ... });
+    test('proceeds to payment', async ({ page }) => { ... });
+  });
+
+
+Scaling beyond one machine: sharding
+--------------------------------------
+Workers parallelize within a single machine. To scale across MULTIPLE
+machines (typically multiple CI runners), use sharding:
+
+  npx playwright test --shard=1/4
+  npx playwright test --shard=2/4
+  npx playwright test --shard=3/4
+  npx playwright test --shard=4/4
+
+Playwright resolves the full test list once, splits it evenly by index,
+and each shard only executes its slice. Shards are commonly driven by a
+CI matrix strategy so each one runs as an independent job on its own
+runner. After all shards finish, blob reports from each shard are
+combined into one unified report:
+
+  npx playwright merge-reports --reporter=html ./all-blob-reports
+
+
+Worker recycling and retries
+------------------------------
+By default, a worker process is reused across many test files to avoid
+the overhead of starting a fresh Node.js process (and fresh browser) for
+every single file. A worker is only recycled early when:
+
+  - A test in that worker times out
+  - A test in that worker crashes the browser or the process itself
+  - `retries` is configured and a failed test needs a completely clean
+    slate for its retry attempt
+
+    export default defineConfig({
+      retries: 2,          // retry a failing test up to twice
+      workers: 4,
+    });
+
+A retried test always runs in a fresh worker context, specifically so
+that a flaky failure caused by polluted state from the first attempt
+cannot silently "fix itself" on retry without you noticing.
+
+
+Useful environment variables
+------------------------------
+  TEST_WORKER_INDEX     Zero-based index of the current worker (0..N-1),
+                         useful for deriving a unique port, DB schema, or
+                         test account per worker.
+  TEST_PARALLEL_INDEX   Similar to TEST_WORKER_INDEX but guaranteed to
+                         stay within the configured `workers` count even
+                         across retries and re-used workers.
+  CI                    Commonly used inside playwright.config.ts to pick
+                         a different `workers` value for CI vs local runs.
+
+
+Common pitfalls
+-----------------
+  - Hard-coded ports (e.g. always binding a mock server to 3000) break
+    the moment two workers try to run the same test file concurrently
+    on the same machine. Derive the port from TEST_WORKER_INDEX instead.
+  - Global counters or singletons at module scope only protect against
+    collisions WITHIN a worker's process, not across workers \u2014 use
+    per-worker or per-test unique identifiers for anything written to a
+    shared backend (database rows, uploaded files, queue messages).
+  - Overriding `workers` too aggressively upward on a memory-constrained
+    CI runner tends to trade wall-clock time for flakiness, as browsers
+    get starved of memory and pages start failing to load reliably.
+
+
+Practical guidance
+-------------------
+  - Start by tuning `workers` before reaching for sharding \u2014 it is
+    free, requires no CI changes, and covers most suites comfortably.
+  - Reach for sharding once a single machine's core count stops being
+    the bottleneck (i.e. more workers no longer reduces wall-clock time).
+  - Never rely on tests running in a particular order unless they are
+    explicitly wrapped in test.describe.serial().
+  - Treat any resource outside the browser (ports, shared files, shared
+    test accounts) as something that needs per-worker uniqueness.
+  - Set `retries` above 0 in CI even for a healthy suite \u2014 it turns
+    genuinely rare, hard-to-reproduce flakes into a single retry line in
+    the report instead of a full pipeline failure.
